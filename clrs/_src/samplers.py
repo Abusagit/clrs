@@ -20,15 +20,20 @@ import collections
 import inspect
 import types
 
-from typing import Any, Callable, List, Optional, Tuple
-from absl import logging
+from typing import Any, Callable, List, Optional, Tuple, Union
+from pathlib import Path
+
+import logging
+
 
 from clrs._src import algorithms
 from clrs._src import probing
 from clrs._src import specs
 import jax
 import numpy as np
+import networkx as nx
 
+logger = logging.getLogger(__name__)
 
 _Array = np.ndarray
 _DataPoint = probing.DataPoint
@@ -61,7 +66,6 @@ CLRS30 = types.MappingProxyType({
     },
 })
 
-
 class Sampler(abc.ABC):
   """Sampler abstract base class."""
 
@@ -70,6 +74,7 @@ class Sampler(abc.ABC):
       algorithm: Algorithm,
       spec: specs.Spec,
       num_samples: int,
+      data_path: Union[Path, None],
       *args,
       seed: Optional[int] = None,
       **kwargs,
@@ -91,13 +96,16 @@ class Sampler(abc.ABC):
     # Use `RandomState` to ensure deterministic sampling across Numpy versions.
     self._rng = np.random.RandomState(seed)
     self._spec = spec
+    self._data_path = data_path
     self._num_samples = num_samples
     self._algorithm = algorithm
     self._args = args
     self._kwargs = kwargs
+    self.seed = seed
+    
 
-    if num_samples < 0:
-      logging.warning('Sampling dataset on-the-fly, unlimited samples.')
+    if num_samples < 0 and not data_path:
+      logger.warning('Sampling dataset on-the-fly, unlimited samples.')
       # Just get an initial estimate of max hint length
       self.max_steps = -1
       for _ in range(1000):
@@ -109,27 +117,52 @@ class Sampler(abc.ABC):
           if dp.data.shape[0] > self.max_steps:
             self.max_steps = dp.data.shape[0]
     else:
-      logging.info('Creating a dataset with %i samples.', num_samples)
+      logger.info('Creating a dataset with %i samples.', num_samples)
       (self._inputs, self._outputs, self._hints,
        self._lengths) = self._make_batch(num_samples, spec, 0, algorithm, *args,
                                          **kwargs)
 
   def _make_batch(self, num_samples: int, spec: specs.Spec, min_length: int,
                   algorithm: Algorithm, *args, **kwargs):
-    """Generate a batch of data."""
-    inputs = []
-    outputs = []
-    hints = []
 
-    for _ in range(num_samples):
-      data = self._sample_data(*args, **kwargs)
+    """Generate a batch of data."""
+    
+    def probe_data_on_algorithm(data: Any):
+      nonlocal inputs, outputs, hints
+      
       _, probes = algorithm(*data)
       inp, outp, hint = probing.split_stages(probes, spec)
       inputs.append(inp)
       outputs.append(outp)
       hints.append(hint)
+      
       if len(hints) % 1000 == 0:
-        logging.info('%i samples created', len(hints))
+        logger.info('%i samples created', len(hints))
+            
+    inputs = []
+    outputs = []
+    hints = []
+    
+    
+    if self._data_path:
+      logger.info(f"A test file has been provided, sampling form the file ({self._data_path})")
+      
+      array_of_data: _Array = np.load(self._data_path).astype(float)
+      
+      length = array_of_data.shape[1] # size of a graph or stuff like that
+      
+      kwargs["length"] = kwargs["length"] if kwargs["length"] > 0 else length # this assumption for tthe case when "length == -1" is passed. We will sample from additional file, thus we need a valid length
+      
+      for data in array_of_data:
+        
+        data = self._sample_data(*args, data_given=data, **kwargs) # transform data to desired format
+        probe_data_on_algorithm(data=data)
+      
+    else:
+      for _ in range(num_samples):
+        data = self._sample_data(*args, **kwargs)
+        probe_data_on_algorithm(data=data)
+
 
     # Batch and pad trajectories to max(T).
     inputs = _batch_io(inputs)
@@ -152,7 +185,7 @@ class Sampler(abc.ABC):
             batch_size, self._spec, self.max_steps,
             self._algorithm, *self._args, **self._kwargs)
         if hints[0].data.shape[0] > self.max_steps:
-          logging.warning('Increasing hint lengh from %i to %i',
+          logger.warning('Increasing hint lengh from %i to %i',
                           self.max_steps, hints[0].data.shape[0])
           self.max_steps = hints[0].data.shape[0]
       else:
@@ -179,7 +212,8 @@ class Sampler(abc.ABC):
     return Feedback(Features(inputs, hints, lengths), outputs)
 
   @abc.abstractmethod
-  def _sample_data(self, length: int, *args, **kwargs) -> List[_Array]:
+  def _sample_data(self, length: int, data_given: Union[None, _Array, Any]=None,
+                   *args, **kwargs) -> List[_Array]:
     pass
 
   def _random_sequence(self, length, low=0.0, high=1.0):
@@ -197,18 +231,48 @@ class Sampler(abc.ABC):
     mat = self._rng.binomial(1, p, size=(nb_nodes, nb_nodes))
     if not directed:
       mat *= np.transpose(mat)
-    elif acyclic:
+    if acyclic:
       mat = np.triu(mat, k=1)
       p = self._rng.permutation(nb_nodes)  # To allow nontrivial solutions
       mat = mat[p, :][:, p]
+      
+      
     if weighted:
       weights = self._rng.uniform(low=low, high=high, size=(nb_nodes, nb_nodes))
       if not directed:
         weights *= np.transpose(weights)
         weights = np.sqrt(weights + 1e-3)  # Add epsilon to protect underflow
       mat = mat.astype(float) * weights
+      
     return mat
-
+  
+  def _random_er_graph_correct(self, nb_nodes, p=0.5, directed=False, acyclic=False,
+                       weighted=False, low=0.0, high=1.0): # TODO
+    
+    matrix = nx.to_numpy_matrix(
+                      nx.random_graphs.gnp_random_graph(
+                                  n=nb_nodes, 
+                                  p=p, 
+                                  directed=directed, 
+                                  seed=self.seed)
+                    )
+    
+    if acyclic:
+      matrix = np.triu(matrix, k=1)
+      p = self._rng.permutation(nb_nodes)  # To allow nontrivial solutions
+      matrix = matrix[p, :][:, p]
+    
+    if weighted:
+      weights = self._rng.uniform(low=low, high=high, size=(nb_nodes, nb_nodes))
+      
+      if not directed:
+        weights[np.tril_indices_from(weights)] = 0
+        weights += np.transpose(weights)
+        
+      matrix = matrix.astype(float) * weights
+    
+    return matrix
+  
   def _random_community_graph(self, nb_nodes, k=4, p=0.5, eps=0.01,
                               directed=False, acyclic=False, weighted=False,
                               low=0.0, high=1.0):
@@ -259,6 +323,7 @@ class Sampler(abc.ABC):
 def build_sampler(
     name: str,
     num_samples: int,
+    data_path: Union[Path, None],
     *args,
     seed: Optional[int] = None,
     **kwargs,
@@ -274,9 +339,9 @@ def build_sampler(
   sampler_args = inspect.signature(sampler_class._sample_data).parameters  # pylint:disable=protected-access
   clean_kwargs = {k: kwargs[k] for k in kwargs if k in sampler_args}
   if set(clean_kwargs) != set(kwargs):
-    logging.warning('Ignoring kwargs %s when building sampler class %s',
+    logger.warning('Ignoring kwargs %s when building sampler class %s',
                     set(kwargs).difference(clean_kwargs), sampler_class)
-  sampler = sampler_class(algorithm, spec, num_samples, seed=seed,
+  sampler = sampler_class(algorithm, spec, num_samples, seed=seed, data_path=data_path,
                           *args, **clean_kwargs)
   return sampler, spec
 
@@ -289,7 +354,12 @@ class SortingSampler(Sampler):
       length: int,
       low: float = 0.,
       high: float = 1.,
+      data_given: Union[None, _Array, Any]=None,
   ):
+    if data_given is not None:
+      return [data_given]
+    
+    
     arr = self._random_sequence(length=length, low=low, high=high)
     return [arr]
 
@@ -302,8 +372,13 @@ class SearchSampler(Sampler):
       length: int,
       low: float = 0.,
       high: float = 1.,
+      data_given: Union[None, _Array, Any]=None,
   ):
-    arr = self._random_sequence(length=length, low=low, high=high)
+    
+    if data_given is not None:
+      arr = data_given
+    else:
+      arr = self._random_sequence(length=length, low=low, high=high)
     arr.sort()
     x = self._rng.uniform(low=low, high=high)
     return [x, arr]
@@ -317,7 +392,11 @@ class MaxSubarraySampler(Sampler):
       length: int,
       low: float = -1.,
       high: float = 1.,
+      data_given: Union[None, _Array, Any]=None,
   ):
+    if data_given is not None:
+      return [data_given]
+    
     arr = self._random_sequence(length=length, low=low, high=high)
     return [arr]
 
@@ -330,11 +409,18 @@ class LCSSampler(Sampler):
       length: int,
       length_2: Optional[int] = None,
       chars: int = 4,
+      data_given: Union[None, _Array, Any]=None,
   ):
+    if data_given is not None:
+      return data_given
+    
+    
     if length_2 is None:
       # Assume provided length is total length.
       length_2 = length // 2
       length -= length_2
+      
+      
     a = self._random_string(length=length, chars=chars)
     b = self._random_string(length=length_2, chars=chars)
     return [a, b]
@@ -346,7 +432,11 @@ class OptimalBSTSampler(Sampler):
   def _sample_data(
       self,
       length: int,
+      data_given: Union[None, _Array, Any]=None,
   ):
+    if data_given is not None:
+      return data_given
+    
     tot_length = length + (length + 1)
     arr = self._random_sequence(length=tot_length, low=0.0, high=1.0)
     arr /= np.sum(arr)
@@ -363,7 +453,11 @@ class ActivitySampler(Sampler):
       length: int,
       low: float = 0.,
       high: float = 1.,
+      data_given: Union[None, _Array, Any]=None,
   ):
+    if data_given is not None:
+      return data_given
+    
     arr_1 = self._random_sequence(length=length, low=low, high=high)
     arr_2 = self._random_sequence(length=length, low=low, high=high)
     return [np.minimum(arr_1, arr_2), np.maximum(arr_1, arr_2)]
@@ -378,7 +472,11 @@ class TaskSampler(Sampler):
       max_deadline: Optional[int] = None,
       low: float = 0.,
       high: float = 1.,
+      data_given: Union[None, _Array, Any]=None,
   ):
+    if data_given is not None:
+      return data_given
+    
     if max_deadline is None:
       max_deadline = length
     d = self._random_string(length=length, chars=max_deadline) + 1
@@ -393,7 +491,12 @@ class DfsSampler(Sampler):
       self,
       length: int,
       p: Tuple[float, ...] = (0.5,),
+      data_given: Union[None, _Array, Any]=None,
   ):
+    
+    if data_given is not None:
+      return [data_given]
+    
     graph = self._random_er_graph(
         nb_nodes=length, p=self._rng.choice(p),
         directed=True, acyclic=False, weighted=False)
@@ -407,10 +510,15 @@ class BfsSampler(Sampler):
       self,
       length: int,
       p: Tuple[float, ...] = (0.5,),
+      data_given: Union[None, _Array, Any]=None,
   ):
-    graph = self._random_er_graph(
-        nb_nodes=length, p=self._rng.choice(p),
-        directed=False, acyclic=False, weighted=False)
+    if data_given is not None:
+      graph = data_given
+    else:    
+      graph = self._random_er_graph(
+          nb_nodes=length, p=self._rng.choice(p),
+          directed=False, acyclic=False, weighted=False)
+      
     source_node = self._rng.choice(length)
     return [graph, source_node]
 
@@ -422,7 +530,12 @@ class TopoSampler(Sampler):
       self,
       length: int,
       p: Tuple[float, ...] = (0.5,),
+      data_given: Union[None, _Array, Any]=None,
   ):
+    
+    if data_given is not None:
+      return [data_given]
+    
     graph = self._random_er_graph(
         nb_nodes=length, p=self._rng.choice(p),
         directed=True, acyclic=True, weighted=False)
@@ -436,7 +549,12 @@ class ArticulationSampler(Sampler):
       self,
       length: int,
       p: Tuple[float, ...] = (0.2,),
+      data_given: Union[None, _Array, Any]=None,
+
   ):
+    if data_given is not None:
+      return [data_given]
+    
     graph = self._random_er_graph(
         nb_nodes=length, p=self._rng.choice(p), directed=False,
         acyclic=False, weighted=False)
@@ -452,7 +570,12 @@ class MSTSampler(Sampler):
       p: Tuple[float, ...] = (0.2,),  # lower p to account for class imbalance
       low: float = 0.,
       high: float = 1.,
+      data_given: Union[None, _Array, Any]=None,
   ):
+    
+    if data_given is not None:
+      return [data_given]
+    
     graph = self._random_er_graph(
         nb_nodes=length,
         p=self._rng.choice(p),
@@ -473,15 +596,20 @@ class BellmanFordSampler(Sampler):
       p: Tuple[float, ...] = (0.5,),
       low: float = 0.,
       high: float = 1.,
+      data_given: Union[None, _Array, Any]=None,
   ):
-    graph = self._random_er_graph(
-        nb_nodes=length,
-        p=self._rng.choice(p),
-        directed=False,
-        acyclic=False,
-        weighted=True,
-        low=low,
-        high=high)
+    if data_given is not None:
+      graph = data_given
+      
+    else:
+      graph = self._random_er_graph(
+          nb_nodes=length,
+          p=self._rng.choice(p),
+          directed=False,
+          acyclic=False,
+          weighted=True,
+          low=low,
+          high=high)
     source_node = self._rng.choice(length)
     return [graph, source_node]
 
@@ -495,15 +623,19 @@ class DAGPathSampler(Sampler):
       p: Tuple[float, ...] = (0.5,),
       low: float = 0.,
       high: float = 1.,
+      data_given: Union[None, _Array, Any]=None,
   ):
-    graph = self._random_er_graph(
-        nb_nodes=length,
-        p=self._rng.choice(p),
-        directed=True,
-        acyclic=True,
-        weighted=True,
-        low=low,
-        high=high)
+    if data_given is not None:
+      graph = data_given
+    else:
+      graph = self._random_er_graph(
+          nb_nodes=length,
+          p=self._rng.choice(p),
+          directed=True,
+          acyclic=True,
+          weighted=True,
+          low=low,
+          high=high)
     source_node = self._rng.choice(length)
     return [graph, source_node]
 
@@ -517,7 +649,11 @@ class FloydWarshallSampler(Sampler):
       p: Tuple[float, ...] = (0.5,),
       low: float = 0.,
       high: float = 1.,
+      data_given: Union[None, _Array, Any]=None,
   ):
+    if data_given is not None:
+      return [data_given]
+    
     graph = self._random_er_graph(
         nb_nodes=length,
         p=self._rng.choice(p),
@@ -538,7 +674,11 @@ class SccSampler(Sampler):
       k: int = 4,
       p: Tuple[float, ...] = (0.5,),
       eps: float = 0.01,
+      data_given: Union[None, _Array, Any]=None,
   ):
+    if data_given is not None:
+      return [data_given]
+    
     graph = self._random_community_graph(
         nb_nodes=length, k=k, p=self._rng.choice(p), eps=eps,
         directed=True, acyclic=False, weighted=False)
@@ -553,7 +693,12 @@ class BipartiteSampler(Sampler):
       length: int,
       length_2: Optional[int] = None,
       p: Tuple[float, ...] = (0.3,),
+      data_given: Union[None, _Array, Any]=None,
   ):
+    if data_given is not None:
+      return data_given
+    
+    
     if length_2 is None:
       # Assume provided length is total length.
       length_2 = length // 2
@@ -571,7 +716,13 @@ class MatcherSampler(Sampler):
       length: int,  # length of haystack + needle, i.e., total number of nodes
       length_needle: Optional[int] = None,
       chars: int = 4,
+      data_given: Union[None, _Array, Any]=None,
   ):
+    
+    if data_given is not None:
+      return data_given
+    
+    
     if length_needle is None:
       if length < 5:
         length_needle = 1
@@ -590,9 +741,14 @@ class MatcherSampler(Sampler):
 class SegmentsSampler(Sampler):
   """Two-segment sampler of points from (U[0, 1], U[0, 1])."""
 
-  def _sample_data(self, length: int, low: float = 0., high: float = 1.):
+  def _sample_data(self, length: int, low: float = 0., high: float = 1., 
+                   data_given: Union[None, _Array, Any]=None,
+                   ):
     del length  # There are exactly four endpoints.
 
+    if data_given is not None:
+      return data_given
+    
     # Quick CCW check (ignoring collinearity) for rejection sampling
     def ccw(x_a, y_a, x_b, y_b, x_c, y_c):
       return (y_c - y_a) * (x_b - x_a) > (y_b - y_a) * (x_c - x_a)
@@ -619,8 +775,14 @@ class ConvexHullSampler(Sampler):
   """Convex hull sampler of points over a disk of radius r."""
 
   def _sample_data(self, length: int, origin_x: float = 0.,
-                   origin_y: float = 0., radius: float = 2.):
-
+                   origin_y: float = 0., radius: float = 2.,
+                   data_given: Union[None, _Array, Any]=None,
+                   ):
+    
+    if data_given is not None:
+      return data_given
+    
+    
     thetas = self._random_sequence(length=length, low=0.0, high=2.0 * np.pi)
     rs = radius * np.sqrt(
         self._random_sequence(length=length, low=0.0, high=1.0))
@@ -687,7 +849,9 @@ def _batch_io(traj_io: Trajectories) -> Trajectory:
 
 
 def _batch_hints(
-    traj_hints: Trajectories, min_steps: int) -> Tuple[Trajectory, List[int]]:
+    traj_hints: Trajectories, 
+    min_steps: int
+  ) -> Tuple[Trajectory, List[int]]:
   """Batches a trajectory of hints samples along the time axis per probe.
 
   Unlike i/o, hints have a variable-length time dimension. Before batching, each
@@ -736,7 +900,7 @@ def _subsample_data(
     trajectory: Trajectory,
     idx: List[int],
     axis: int = 0,
-) -> Trajectory:
+  ) -> Trajectory:
   """New `Trajectory` where each `DataPoint`'s data is subsampled along axis."""
   sampled_traj = []
   for dp in trajectory:
