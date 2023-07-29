@@ -49,7 +49,8 @@ def _build_default_builder_configs():
   for split in ['train', 'val', 'test']:
     for alg in specs.CLRS_30_ALGS:
       DEFAULT_BUILDER_CONFIGS.append(
-          CLRSConfig(name=f'{alg}_{split}', split=split))
+          CLRSConfig(name=f'{alg}_{split}', split=split)
+        )
 
 
 _build_default_builder_configs()
@@ -163,6 +164,7 @@ def _preprocess(data_point, algorithm=None):
     assert stage == data_point_name[0]
     if stage == specs.Stage.HINT:
       data = tf.experimental.numpy.swapaxes(data, 0, 1)
+    
     dp = probing.DataPoint(name, location, dp_type, data)
     if stage == specs.Stage.INPUT:
       inputs.append(dp)
@@ -171,19 +173,26 @@ def _preprocess(data_point, algorithm=None):
     else:
       hints.append(dp)
   return samplers.Feedback(
-      samplers.Features(tuple(inputs), tuple(hints), lengths), tuple(outputs))
+                          samplers.Features(tuple(inputs), tuple(hints), lengths), 
+                          tuple(outputs)
+                          )
 
 
-def create_dataset(folder, algorithm, split, batch_size):
+def create_dataset(folder, 
+                   algorithm, 
+                   split, 
+                   batch_size
+                   ):
   dataset = tfds.load(f'clrs_dataset/{algorithm}_{split}',
                       data_dir=folder, split=split)
+  
+  
   num_samples = len(dataset)  # Must be done here for correct size
   dataset = dataset.repeat()
   dataset = dataset.batch(batch_size)
   return (dataset.map(lambda d: _preprocess(d, algorithm=algorithm)),
           num_samples,
           specs.SPECS[algorithm])
-
 
 def _copy_hint(source, dest, i, start_source, start_dest, to_add):
   """Copy from full-sample hint to a hint chunk."""
@@ -319,6 +328,7 @@ def chunkify(dataset: Iterator[samplers.Feedback], chunk_length: int):
 def create_chunked_dataset(folder, algorithm, split, batch_size, chunk_length):
   dataset = tfds.load(f'clrs_dataset/{algorithm}_{split}',
                       data_dir=folder, split=split)
+
   dataset = dataset.repeat()
   dataset = dataset.batch(batch_size)
   dataset = dataset.map(lambda d: _preprocess(d, algorithm=algorithm))
