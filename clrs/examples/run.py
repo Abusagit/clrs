@@ -14,6 +14,7 @@
 # ==============================================================================
 
 """Run training of one or more algorithmic tasks from CLRS."""
+import sys
 
 import functools
 import os
@@ -22,15 +23,52 @@ from typing import Any, Dict, List
 
 from absl import app
 from absl import flags
-from absl import logging
+
+import logging
+
 import clrs
 import jax
 import numpy as np
 import requests
 import tensorflow as tf
 
+from pathlib import Path
+from typing import Union
 
-flags.DEFINE_list('algorithms', ['bfs'], 'Which algorithms to run.')
+import json
+
+
+def get_logger(checkpoint_path: str) -> logging.Logger:
+  root = logging.getLogger()
+  root.setLevel(logging.INFO)
+  
+  stringfmt = "[%(asctime)s] [%(threadName)s] [%(name)s] [%(levelname)s] %(message)s"
+  datefmt = "%Y-%m-%d %H:%M:%S"
+  formatter = logging.Formatter(fmt=stringfmt, datefmt=datefmt)
+
+  console_handler = logging.StreamHandler(sys.stdout)
+  console_handler.setLevel(logging.INFO)
+  console_handler.setFormatter(formatter)
+  
+  filename =  Path(checkpoint_path) / "log.log"
+  file_handler = logging.FileHandler(filename=filename, 
+                                      mode="w", 
+                                      encoding="utf-8")
+  file_handler.setFormatter(formatter)
+  file_handler.setLevel(logging.INFO)
+
+
+
+  root.addHandler(console_handler)
+  root.addHandler(file_handler)
+  
+  return root
+
+
+
+flags.DEFINE_list('algorithms', ['dfs',
+                                 ], 
+                  'Which algorithms to run.')
 flags.DEFINE_list('train_lengths', ['4', '7', '11', '13', '16'],
                   'Which training sizes to use. A size of -1 means '
                   'use the benchmark dataset.')
@@ -116,11 +154,21 @@ flags.DEFINE_string('checkpoint_path', '/tmp/CLRS30',
                     'Path in which checkpoints are saved.')
 flags.DEFINE_string('dataset_path', '/tmp/CLRS30',
                     'Path in which dataset is stored.')
+
+flags.DEFINE_string('test_from_file', '', 'If provided, the final test will be sampled from this file')
+flags.DEFINE_string('model_params_file', '', 'Path to model parameters')
+flags.DEFINE_boolean('test_only', False, 'Perform only test evaluation, skip training. Flag "model_params_file" must be specified')
+
+flags.DEFINE_boolean('force', False, "Override the output directory")
+
+
 flags.DEFINE_boolean('freeze_processor', False,
                      'Whether to freeze the processor of the model.')
 
-FLAGS = flags.FLAGS
+flags.DEFINE_integer('early_stopping_evals', 10, 'Number of evaluations needed for early stopping')
+flags.DEFINE_integer('test_size', -1, 'Size of an item in the test. If -1 is passed, the CLRS30 dataset will be used')
 
+FLAGS = flags.FLAGS
 
 PRED_AS_INPUT_ALGOS = [
     'binary_search',
@@ -134,9 +182,11 @@ PRED_AS_INPUT_ALGOS = [
     'task_scheduling',
     'naive_string_matcher',
     'kmp_matcher',
-    'jarvis_march']
+    'jarvis_march',
+    ]
 
 
+  
 def unpack(v):
   try:
     return v.item()  # DeviceArray
@@ -153,9 +203,9 @@ def _maybe_download_dataset(dataset_path):
   """Download CLRS30 dataset if needed."""
   dataset_folder = os.path.join(dataset_path, clrs.get_clrs_folder())
   if os.path.isdir(dataset_folder):
-    logging.info('Dataset found at %s. Skipping download.', dataset_folder)
+    ROOT.info('Dataset found at %s. Skipping download.', dataset_folder)
     return dataset_folder
-  logging.info('Dataset not found in %s. Downloading...', dataset_folder)
+  ROOT.info('Dataset not found in %s. Downloading...', dataset_folder)
 
   clrs_url = clrs.get_dataset_gcp_url()
   request = requests.get(clrs_url, allow_redirects=True)
@@ -178,7 +228,9 @@ def make_sampler(length: int,
                  enforce_permutations: bool,
                  chunked: bool,
                  chunk_length: int,
-                 sampler_kwargs: Dict[str, Any]):
+                 sampler_kwargs: Dict[str, Any],
+                 data_path: Union[str, None]=None,
+                 ):
   """Create a sampler with given options.
 
   Args:
@@ -202,12 +254,13 @@ def make_sampler(length: int,
     A sampler (iterator), the number of samples in the iterator (negative
     if infinite samples), and the spec.
   """
-  if length < 0:  # load from file
+  if length < 0 and not data_path:  # load from file
     dataset_folder = _maybe_download_dataset(FLAGS.dataset_path)
     sampler, num_samples, spec = clrs.create_dataset(folder=dataset_folder,
                                                      algorithm=algorithm,
                                                      batch_size=batch_size,
                                                      split=split)
+    
     sampler = sampler.as_numpy_iterator()
   else:
     num_samples = clrs.CLRS30[split]['num_samples'] * multiplier
@@ -216,6 +269,7 @@ def make_sampler(length: int,
         seed=rng.randint(2**32),
         num_samples=num_samples,
         length=length,
+        data_path=data_path,
         **sampler_kwargs,
         )
     sampler = _iterate_sampler(sampler, batch_size)
@@ -249,16 +303,35 @@ def make_multi_sampler(sizes, rng, **kwargs):
 def _concat(dps, axis):
   return jax.tree_util.tree_map(lambda *x: np.concatenate(x, axis), *dps)
 
+TEST = False
+GRAPHS_FROM_TEST = []
 
-def collect_and_eval(sampler, predict_fn, sample_count, rng_key, extras):
+def collect_and_eval(
+          sampler, 
+          predict_fn, 
+          sample_count, 
+          rng_key, 
+          extras,
+  ):
+  
+  global TEST, GRAPHS_FROM_TEST
+  
   """Collect batches of output and hint preds and evaluate them."""
   processed_samples = 0
   preds = []
   outputs = []
+  
+  
   while processed_samples < sample_count:
     feedback = next(sampler)
     batch_size = feedback.outputs[0].data.shape[0]
     outputs.append(feedback.outputs)
+    if TEST:
+      # need to save "A" from input - it is an adjecency matrix
+      for datapoint in feedback.features.inputs:
+        if datapoint.name == "A":
+          GRAPHS_FROM_TEST.append(datapoint.data)
+      
     new_rng_key, rng_key = jax.random.split(rng_key)
     cur_preds, _ = predict_fn(new_rng_key, feedback.features)
     preds.append(cur_preds)
@@ -266,12 +339,22 @@ def collect_and_eval(sampler, predict_fn, sample_count, rng_key, extras):
   outputs = _concat(outputs, axis=0)
   preds = _concat(preds, axis=0)
   out = clrs.evaluate(outputs, preds)
+  
+  
+  if TEST:
+    for _ in range(11):
+      feedback = next(sampler)
+      for datapoint in feedback.features.inputs:
+        if datapoint.name == "A":
+          GRAPHS_FROM_TEST.append(datapoint.data)
   if extras:
     out.update(extras)
+    
+    
   return {k: unpack(v) for k, v in out.items()}
 
 
-def create_samplers(rng, train_lengths: List[int]):
+def create_samplers(rng, train_lengths: List[int], mayde_path_to_test_datafile: str):
   """Create all the samplers."""
   train_samplers = []
   val_samplers = []
@@ -296,7 +379,7 @@ def create_samplers(rng, train_lengths: List[int]):
         if FLAGS.chunked_training:
           train_lengths = train_lengths * len(train_lengths)
 
-      logging.info('Creating samplers for algo %s', algorithm)
+      ROOT.info('Creating samplers for algo %s', algorithm)
 
       p = tuple([0.1 + 0.1 * i for i in range(9)])
       if p and algorithm in ['articulation_points', 'bridges',
@@ -315,7 +398,7 @@ def create_samplers(rng, train_lengths: List[int]):
           enforce_pred_as_input=FLAGS.enforce_pred_as_input,
           enforce_permutations=FLAGS.enforce_permutations,
           chunk_length=FLAGS.chunk_length,
-          )
+        )
 
       train_args = dict(sizes=train_lengths,
                         split='train',
@@ -337,13 +420,21 @@ def create_samplers(rng, train_lengths: List[int]):
                       sampler_kwargs=sampler_kwargs,
                       **common_sampler_args)
       val_sampler, val_samples, spec = make_multi_sampler(**val_args)
-
-      test_args = dict(sizes=[-1],
+      
+      
+      if len(mayde_path_to_test_datafile) == 0:
+        test_file = None
+      else:
+        test_file = Path(mayde_path_to_test_datafile)
+        
+      test_args = dict(
+                       sizes=[FLAGS.test_size],
                        split='test',
                        batch_size=32,
                        multiplier=2 * mult,
                        randomize_pos=False,
                        chunked=False,
+                       data_path=test_file,
                        sampler_kwargs={},
                        **common_sampler_args)
       test_sampler, test_samples, spec = make_multi_sampler(**test_args)
@@ -362,6 +453,13 @@ def create_samplers(rng, train_lengths: List[int]):
 
 
 def main(unused_argv):
+  
+  global ROOT
+  
+  Path(FLAGS.checkpoint_path).mkdir(parents=True, exist_ok=FLAGS.force)
+  
+  ROOT = get_logger(checkpoint_path=FLAGS.checkpoint_path)
+  
   if FLAGS.hint_mode == 'encoded_decoded':
     encode_hints = True
     decode_hints = True
@@ -379,11 +477,15 @@ def main(unused_argv):
   rng = np.random.RandomState(FLAGS.seed)
   rng_key = jax.random.PRNGKey(rng.randint(2**32))
 
+  
+  if FLAGS.test_from_file == "''":
+    FLAGS.test_from_file = '' # handle bash behaviour with empty string arguments
+
   # Create samplers
   (train_samplers,
    val_samplers, val_sample_counts,
    test_samplers, test_sample_counts,
-   spec_list) = create_samplers(rng, train_lengths)
+   spec_list) = create_samplers(rng, train_lengths, mayde_path_to_test_datafile=FLAGS.test_from_file)
 
   processor_factory = clrs.get_processor_factory(
       FLAGS.processor_type,
@@ -422,7 +524,11 @@ def main(unused_argv):
   else:
     train_model = eval_model
 
+
+  
+  
   # Training loop.
+
   best_score = -1.0
   current_train_items = [0] * len(FLAGS.algorithms)
   step = 0
@@ -431,23 +537,33 @@ def main(unused_argv):
   # until all algos have had at least one evaluation.
   val_scores = [-99999.9] * len(FLAGS.algorithms)
   length_idx = 0
-
+  
+  early_stopping = 0
+  
+  
+  val_test_dumps: List[Dict[str, Any]] = []
+  
+  
   while step < FLAGS.train_steps:
     feedback_list = [next(t) for t in train_samplers]
-
-    # Initialize model.
+    
     if step == 0:
-      all_features = [f.features for f in feedback_list]
-      if FLAGS.chunked_training:
-        # We need to initialize the model with samples of all lengths for
-        # all algorithms. Also, we need to make sure that the order of these
-        # sample sizes is the same as the order of the actual training sizes.
-        all_length_features = [all_features] + [
-            [next(t).features for t in train_samplers]
-            for _ in range(len(train_lengths))]
-        train_model.init(all_length_features[:-1], FLAGS.seed + 1)
-      else:
-        train_model.init(all_features, FLAGS.seed + 1)
+        # Initialize model.
+
+        all_features = [f.features for f in feedback_list]
+        if FLAGS.chunked_training:
+          # We need to initialize the model with samples of all lengths for
+          # all algorithms. Also, we need to make sure that the order of these
+          # sample sizes is the same as the order of the actual training sizes.
+          all_length_features = [all_features] + [
+              [next(t).features for t in train_samplers]
+              for _ in range(len(train_lengths))]
+          train_model.init(all_length_features[:-1], FLAGS.seed + 1)
+        else:
+          train_model.init(all_features, FLAGS.seed + 1)
+        
+        if FLAGS.test_only:
+          break
 
     # Training step.
     for algo_idx in range(len(train_samplers)):
@@ -469,17 +585,21 @@ def main(unused_argv):
       else:
         examples_in_chunk = len(feedback.features.lengths)
       current_train_items[algo_idx] += examples_in_chunk
-      logging.info('Algo %s step %i current loss %f, current_train_items %i.',
-                   FLAGS.algorithms[algo_idx], step,
-                   cur_loss, current_train_items[algo_idx])
+      ROOT.info('Algo %s step %i current loss %f, current_train_items %i.',
+                  FLAGS.algorithms[algo_idx], step,
+                  cur_loss, current_train_items[algo_idx])
 
     # Periodically evaluate model
     if step >= next_eval:
+      
       eval_model.params = train_model.params
+            
       for algo_idx in range(len(train_samplers)):
         common_extras = {'examples_seen': current_train_items[algo_idx],
-                         'step': step,
-                         'algorithm': FLAGS.algorithms[algo_idx]}
+                        'step': step,
+                        'algorithm': FLAGS.algorithms[algo_idx],
+                        'seed': FLAGS.seed,
+}
 
         # Validation info.
         new_rng_key, rng_key = jax.random.split(rng_key)
@@ -489,48 +609,92 @@ def main(unused_argv):
             val_sample_counts[algo_idx],
             new_rng_key,
             extras=common_extras)
-        logging.info('(val) algo %s step %d: %s',
-                     FLAGS.algorithms[algo_idx], step, val_stats)
+        ROOT.info('(val) algo %s step %d: %s',
+                    FLAGS.algorithms[algo_idx], step, val_stats)
         val_scores[algo_idx] = val_stats['score']
+        
+        val_stats['type'] = 'val'
+        
+        val_test_dumps.append(val_stats)
+            
 
       next_eval += FLAGS.eval_every
 
       # If best total score, update best checkpoint.
       # Also save a best checkpoint on the first step.
       msg = (f'best avg val score was '
-             f'{best_score/len(FLAGS.algorithms):.3f}, '
-             f'current avg val score is {np.mean(val_scores):.3f}, '
-             f'val scores are: ')
+            f'{best_score/len(FLAGS.algorithms):.3f}, '
+            f'current avg val score is {np.mean(val_scores):.3f}, '
+            f'val scores are: ')
+      
       msg += ', '.join(
           ['%s: %.3f' % (x, y) for (x, y) in zip(FLAGS.algorithms, val_scores)])
+      
       if (sum(val_scores) > best_score) or step == 0:
         best_score = sum(val_scores)
-        logging.info('Checkpointing best model, %s', msg)
+        ROOT.info('Checkpointing best model, %s', msg)
         train_model.save_model('best.pkl')
+        early_stopping = 0
+        
       else:
-        logging.info('Not saving new best model, %s', msg)
+        # check for early stopping
+        ROOT.info('Not saving new best model, %s', msg)
+        
+        early_stopping += 1
+        
+        if early_stopping >= FLAGS.early_stopping_evals:
+          ROOT.info('Early stopping criterion has been met. Exiting.')
+          break
 
     step += 1
     length_idx = (length_idx + 1) % len(train_lengths)
 
-  logging.info('Restoring best model from checkpoint...')
-  eval_model.restore_model('best.pkl', only_load_processor=False)
 
+  ROOT.info('Restoring best model from checkpoint...')
+  eval_model.restore_model('best.pkl', only_load_processor=False)
+  
+  if FLAGS.test_only:
+    if len(FLAGS.model_params_file) == 0:
+      raise AssertionError("Test-only option was chosen, but model weights were not provided!")
+    
+    
+    ROOT.info('Performing only eval => restoring from provided checkpoint')
+    eval_model.restore_model(FLAGS.model_params_file, only_load_processor=False, merge_with_checkpoint=False)
+    
+  global TEST
+  TEST = True
   for algo_idx in range(len(train_samplers)):
     common_extras = {'examples_seen': current_train_items[algo_idx],
                      'step': step,
-                     'algorithm': FLAGS.algorithms[algo_idx]}
+                     'algorithm': FLAGS.algorithms[algo_idx],
+                     'seed': FLAGS.seed,
+                     }
 
     new_rng_key, rng_key = jax.random.split(rng_key)
     test_stats = collect_and_eval(
-        test_samplers[algo_idx],
-        functools.partial(eval_model.predict, algorithm_index=algo_idx),
-        test_sample_counts[algo_idx],
-        new_rng_key,
-        extras=common_extras)
-    logging.info('(test) algo %s : %s', FLAGS.algorithms[algo_idx], test_stats)
-
-  logging.info('Done!')
+                  test_samplers[algo_idx],
+                  functools.partial(eval_model.predict, algorithm_index=algo_idx),
+                  test_sample_counts[algo_idx],
+                  new_rng_key,
+                  extras=common_extras,
+    )
+    
+    ROOT.info('(test) algo %s : %s', FLAGS.algorithms[algo_idx], test_stats)
+    
+    test_stats['type'] = 'test'
+    val_test_dumps.append(test_stats)
+    
+    
+    graphs_from_test = np.concatenate(GRAPHS_FROM_TEST, axis=0)
+    
+    np.save(Path(FLAGS.checkpoint_path) / "graphs_from_test.npy", graphs_from_test)
+    
+    
+    with open(Path(FLAGS.checkpoint_path) / "val_test_dump.json", "w") as handler:
+      json.dump(val_test_dumps, fp=handler, indent=2)
+  
+  
+  ROOT.info('Done!')
 
 
 if __name__ == '__main__':
