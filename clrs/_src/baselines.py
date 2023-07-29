@@ -468,9 +468,13 @@ class BaselineModel(model.Model):
 
     return losses_
 
-  def restore_model(self, file_name: str, only_load_processor: bool = False):
+  def restore_model(self, file_name: str, only_load_processor: bool = False, merge_with_checkpoint=True):
     """Restore model from `file_name`."""
-    path = os.path.join(self.checkpoint_path, file_name)
+    if merge_with_checkpoint:
+      path = os.path.join(self.checkpoint_path, file_name)
+    else:
+      path = file_name
+      
     with open(path, 'rb') as f:
       restored_state = pickle.load(f)
       if only_load_processor:
